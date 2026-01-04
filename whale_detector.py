@@ -35,6 +35,9 @@ seen_trades = set()  # Set of transaction hashes we've already processed
 def send_telegram_message(message: str) -> bool:
     """Send a message via Telegram bot."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[TELEGRAM ERROR] Missing credentials!")
+        print(f"  BOT_TOKEN set: {bool(TELEGRAM_BOT_TOKEN)}")
+        print(f"  CHAT_ID set: {bool(TELEGRAM_CHAT_ID)}")
         print(f"[ALERT] {message}")
         return False
 
@@ -47,9 +50,15 @@ def send_telegram_message(message: str) -> bool:
 
     try:
         response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
+        if response.status_code == 200:
+            print(f"[TELEGRAM] Message sent successfully!")
+            return True
+        else:
+            print(f"[TELEGRAM ERROR] Status: {response.status_code}")
+            print(f"[TELEGRAM ERROR] Response: {response.text}")
+            return False
     except Exception as e:
-        print(f"[ERROR] Failed to send Telegram message: {e}")
+        print(f"[TELEGRAM ERROR] Exception: {e}")
         return False
 
 
