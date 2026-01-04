@@ -13,8 +13,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Debug: Print what we loaded (masked for security)
+def mask_token(token):
+    if not token or len(token) < 10:
+        return f"EMPTY or TOO SHORT (len={len(token) if token else 0})"
+    return f"{token[:8]}...{token[-4:]} (len={len(token)})"
+
+print(f"[CONFIG] TELEGRAM_BOT_TOKEN: {mask_token(TELEGRAM_BOT_TOKEN)}")
+print(f"[CONFIG] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
 
 # Detection thresholds (adjustable)
 MIN_TRADE_AMOUNT = int(os.getenv("MIN_TRADE_AMOUNT", 500))  # Minimum trade size in USD
