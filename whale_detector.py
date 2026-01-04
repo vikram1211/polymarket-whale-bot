@@ -31,6 +31,8 @@ MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 60))  # Account mus
 MIN_CONCENTRATION = float(os.getenv("MIN_CONCENTRATION", 50))  # Min % of portfolio in single market
 MAX_MARKETS_TRADED = int(os.getenv("MAX_MARKETS_TRADED", 10))  # Max markets they've traded
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 30))  # Seconds between checks
+MIN_TRADES_ON_MARKET = int(os.getenv("MIN_TRADES_ON_MARKET", 3))  # Min trades on same market
+MIN_TOTAL_AMOUNT_ON_MARKET = int(os.getenv("MIN_TOTAL_AMOUNT_ON_MARKET", 5000))  # Min total $ on same market
 
 # API endpoints
 DATA_API = "https://data-api.polymarket.com"
@@ -158,6 +160,55 @@ def get_wallet_stats(wallet: str) -> dict | None:
         return None
 
 
+def get_wallet_trades_on_market(wallet: str, market_id: str) -> dict:
+    """
+    Get wallet's trade history on a specific market.
+    Returns: {"trade_count": int, "total_amount": float, "net_amount": float, "dominant_side": str}
+    """
+    url = f"{DATA_API}/trades"
+    params = {
+        "user": wallet,
+        "market": market_id,
+        "limit": 100
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            trades = response.json()
+
+            trade_count = len(trades)
+            total_buy_amount = 0
+            total_sell_amount = 0
+
+            for t in trades:
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                amount = size * price
+
+                if t.get("side") == "BUY":
+                    total_buy_amount += amount
+                else:
+                    total_sell_amount += amount
+
+            # Net position (buys - sells)
+            net_amount = total_buy_amount - total_sell_amount
+            dominant_side = "BUY" if net_amount > 0 else "SELL"
+
+            return {
+                "trade_count": trade_count,
+                "total_amount": total_buy_amount + total_sell_amount,
+                "net_amount": abs(net_amount),
+                "dominant_side": dominant_side,
+                "buy_amount": total_buy_amount,
+                "sell_amount": total_sell_amount
+            }
+        return {"trade_count": 0, "total_amount": 0, "net_amount": 0, "dominant_side": "UNKNOWN", "buy_amount": 0, "sell_amount": 0}
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch trades for {wallet} on market: {e}")
+        return {"trade_count": 0, "total_amount": 0, "net_amount": 0, "dominant_side": "UNKNOWN", "buy_amount": 0, "sell_amount": 0}
+
+
 def calculate_account_age(profile: dict) -> int:
     """Calculate account age in days."""
     created_at = profile.get("createdAt")
@@ -221,6 +272,19 @@ def analyze_trade(trade: dict) -> dict | None:
     if account_age > MAX_ACCOUNT_AGE_DAYS:
         return None
 
+    # Get wallet's trade history on THIS specific market
+    market_trades = get_wallet_trades_on_market(wallet, market_id)
+    trades_on_market = market_trades["trade_count"]
+    total_amount_on_market = market_trades["total_amount"]
+
+    # Skip if not enough trades on this market
+    if trades_on_market < MIN_TRADES_ON_MARKET:
+        return None
+
+    # Skip if total amount on market is less than threshold
+    if total_amount_on_market < MIN_TOTAL_AMOUNT_ON_MARKET:
+        return None
+
     # Get positions and calculate concentration
     positions = get_wallet_positions(wallet)
     concentration = calculate_portfolio_concentration(positions, market_id)
@@ -229,16 +293,13 @@ def analyze_trade(trade: dict) -> dict | None:
     stats = get_wallet_stats(wallet)
     markets_traded = stats.get("total", 0) if stats else 0
 
-    # Check if it meets our criteria
-    if concentration < MIN_CONCENTRATION and markets_traded > MAX_MARKETS_TRADED:
-        return None
-
     # Calculate a "whale score" (higher = more suspicious)
     whale_score = 0
-    whale_score += min(30, (MAX_ACCOUNT_AGE_DAYS - account_age) / 2)  # Newer = higher score
-    whale_score += min(30, concentration / 3)  # Higher concentration = higher score
-    whale_score += min(20, trade_amount / 500)  # Larger trades = higher score
-    whale_score += min(20, (MAX_MARKETS_TRADED - markets_traded) * 2) if markets_traded < MAX_MARKETS_TRADED else 0
+    whale_score += min(25, (MAX_ACCOUNT_AGE_DAYS - account_age) / 2)  # Newer = higher score
+    whale_score += min(25, concentration / 4)  # Higher concentration = higher score
+    whale_score += min(25, total_amount_on_market / 1000)  # Larger total on market = higher score
+    whale_score += min(15, trades_on_market * 3)  # More trades on same market = higher score
+    whale_score += min(10, (MAX_MARKETS_TRADED - markets_traded)) if markets_traded < MAX_MARKETS_TRADED else 0
 
     return {
         "wallet": wallet,
@@ -251,6 +312,12 @@ def analyze_trade(trade: dict) -> dict | None:
             "amount": round(trade_amount, 2),
             "price": float(trade.get("price", 0)),
             "size": float(trade.get("size", 0))
+        },
+        "market_activity": {
+            "trades_on_market": trades_on_market,
+            "total_amount_on_market": round(total_amount_on_market, 2),
+            "net_position": round(market_trades["net_amount"], 2),
+            "dominant_side": market_trades["dominant_side"]
         },
         "portfolio": {
             "concentration": round(concentration, 1),
@@ -266,6 +333,7 @@ def format_alert_message(analysis: dict) -> str:
     """Format analysis into a Telegram alert message."""
     trade = analysis["trade"]
     portfolio = analysis["portfolio"]
+    market_activity = analysis["market_activity"]
 
     # Determine emoji based on whale score
     if analysis["whale_score"] >= 70:
@@ -278,29 +346,27 @@ def format_alert_message(analysis: dict) -> str:
         emoji = "📊"
         urgency = "LOW"
 
-    # Calculate implied probability
-    if trade["side"] == "BUY":
-        implied_prob = trade["price"] * 100
-    else:
-        implied_prob = (1 - trade["price"]) * 100
-
     message = f"""
 {emoji} <b>WHALE ALERT</b> [{urgency}]
 
 <b>Market:</b> {trade['market']}
 <b>Bet:</b> {trade['outcome']} ({trade['side']})
-<b>Amount:</b> ${trade['amount']:,.2f}
-<b>Price:</b> {trade['price']:.2f} ({implied_prob:.0f}% implied)
+<b>This Trade:</b> ${trade['amount']:,.2f} @ {trade['price']:.2f}
+
+<b>Activity on This Market:</b>
+• Total Trades: {market_activity['trades_on_market']}
+• Total Invested: ${market_activity['total_amount_on_market']:,.2f}
+• Net Position: ${market_activity['net_position']:,.2f} {market_activity['dominant_side']}
 
 <b>Trader Profile:</b>
 • Username: {analysis['username']}
 • Account Age: {analysis['account_age_days']} days
-• Portfolio Focus: {portfolio['concentration']:.0f}% in this market
+• Focus: {portfolio['concentration']:.0f}% portfolio in this market
 • Total Markets: {portfolio['markets_traded']}
 
 <b>Whale Score:</b> {analysis['whale_score']}/100
 
-🔗 <a href="https://polygonscan.com/tx/{analysis['tx_hash']}">View Transaction</a>
+🔗 <a href="https://polygonscan.com/tx/{analysis['tx_hash']}">View TX</a>
 """
     return message.strip()
 
