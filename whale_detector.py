@@ -59,9 +59,36 @@ wallet_cache = {}  # wallet -> {profile, positions, last_updated}
 seen_trades = set()  # Set of trade identifiers we've already processed
 excluded_markets_cache = {"condition_ids": set(), "last_updated": 0}  # Excluded market condition IDs
 
+# Cache size limits
+MAX_WALLET_CACHE_SIZE = 5000
+MAX_SEEN_TRADES_SIZE = 100000
+
 # Stats
 stats = {"trades_received": 0, "trades_processed": 0, "alerts_sent": 0, "skipped_excluded": 0}
 
+
+def cleanup_wallet_cache():
+    """Remove oldest entries from wallet_cache if it exceeds size limit."""
+    if len(wallet_cache) >= MAX_WALLET_CACHE_SIZE:
+        # Sort by last_updated and keep newest half
+        sorted_wallets = sorted(
+            wallet_cache.items(),
+            key=lambda x: x[1].get("last_updated", 0)
+        )
+        # Remove oldest half
+        for wallet, _ in sorted_wallets[:len(sorted_wallets) // 2]:
+            del wallet_cache[wallet]
+        print(f"[CACHE] Cleaned wallet_cache: {len(wallet_cache)} entries remaining")
+
+
+def cleanup_seen_trades():
+    """Remove oldest entries from seen_trades if it exceeds size limit."""
+    global seen_trades
+    if len(seen_trades) > MAX_SEEN_TRADES_SIZE:
+        # Keep newest half (convert to list, slice, convert back)
+        seen_list = list(seen_trades)
+        seen_trades = set(seen_list[len(seen_list) // 2:])
+        print(f"[CACHE] Cleaned seen_trades: {len(seen_trades)} entries remaining")
 
 def send_telegram_message(message: str) -> bool:
     """Send a message via Telegram bot."""
@@ -174,7 +201,8 @@ def get_wallet_profile(wallet: str) -> dict | None:
         response = requests.get(url, params=params, timeout=10)
         if response.status_code == 200:
             profile = response.json()
-            # Update cache
+            # Update cache with size limit
+            cleanup_wallet_cache()
             if wallet not in wallet_cache:
                 wallet_cache[wallet] = {}
             wallet_cache[wallet]["profile"] = profile
@@ -201,7 +229,8 @@ def get_wallet_positions(wallet: str) -> list:
         response = requests.get(url, params=params, timeout=10)
         if response.status_code == 200:
             positions = response.json()
-            # Update cache
+            # Update cache with size limit
+            cleanup_wallet_cache()
             if wallet not in wallet_cache:
                 wallet_cache[wallet] = {}
             wallet_cache[wallet]["positions"] = positions
@@ -494,11 +523,7 @@ def process_trade(trade_data: dict) -> None:
     seen_trades.add(trade_id)
 
     # Keep seen_trades from growing indefinitely
-    if len(seen_trades) > 100000:
-        # Remove oldest half
-        seen_list = list(seen_trades)
-        seen_trades.clear()
-        seen_trades.update(seen_list[50000:])
+    cleanup_seen_trades()
 
     # Calculate trade amount
     size = float(trade_data.get("size", 0))
