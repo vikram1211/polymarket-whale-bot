@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.polymarket.com)",
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(cd:*)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" status)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" diff)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" log --oneline -5)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" remote:*)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" branch:*)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" add whale_detector.py)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Exclude sports and crypto markets from whale detection\")",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" push origin main)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Add decimal odds and shares to alerts\")",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Focus on longshots: filter to <=50% implied probability\")",
+      "Bash(curl:*)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Fix total markets field name \\(traded not total\\)\")",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Increase seen_trades cache to 100k\")",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.polytrackhq.app)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" add whale_detector.py requirements.txt CLAUDE.md)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"$\\(cat <<''EOF''\nv3: Complete rewrite with weighted signal scoring\n\n- Clean architecture with dataclasses and type hints\n- Weighted scoring system \\(0-100\\) replaces boolean signals\n- TTLCache/LRUCache for efficient caching \\(cachetools\\)\n- Filter pipeline: size → odds → market → LP check\n- Signals: fresh_wallet \\(30\\), large_trade \\(25\\), contrarian \\(20\\), concentrated \\(15\\), first_trade \\(10\\)\n- Alert threshold: score >= 40 \\(configurable via MIN_ALERT_SCORE\\)\n- Single positions API call per trade \\(was 2x before\\)\n\n🤖 Generated with [Claude Code]\\(https://claude.ai/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(python:*)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"$\\(cat <<''EOF''\nFix cachetools import and rename stats labels\n\n- Auto-install cachetools on import failure \\(like websocket\\)\n- Rename abbreviated stats to professional labels\n\n🤖 Generated with [Claude Code]\\(https://claude.ai/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" commit -m \"Fix Railway logging: output to stdout instead of stderr\")",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" diff --stat)",
+      "Bash(git -C \"C:\\\\Users\\\\dandu\\\\polymarket-whale-bot\" add whale_detector.py CLAUDE.md requirements.txt)"
+    ]
+  }
+}
