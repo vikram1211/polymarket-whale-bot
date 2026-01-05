@@ -52,10 +52,10 @@ class Config:
     telegram_chat_id: str = ""
     min_trade_size: int = 2000
     min_alert_score: int = 40
-    max_fresh_wallet_age: int = 30
-    size_anomaly_multiplier: float = 3.0
-    timing_hours_before_end: int = 24
-    longshot_threshold: float = 0.35
+    max_fresh_wallet_age: int = 45
+    size_anomaly_multiplier: float = 2.0
+    timing_hours_before_end: int = 48
+    longshot_threshold: float = 0.50
     excluded_tag_ids: list = field(default_factory=lambda: [1, 235])
     stats_interval: int = 15
 
@@ -67,10 +67,10 @@ class Config:
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
             min_trade_size=int(os.getenv("MIN_TRADE_SIZE", 2000)),
             min_alert_score=int(os.getenv("MIN_ALERT_SCORE", 40)),
-            max_fresh_wallet_age=int(os.getenv("MAX_FRESH_WALLET_AGE", 30)),
-            size_anomaly_multiplier=float(os.getenv("SIZE_ANOMALY_MULTIPLIER", 3.0)),
-            timing_hours_before_end=int(os.getenv("TIMING_HOURS_BEFORE_END", 24)),
-            longshot_threshold=float(os.getenv("LONGSHOT_THRESHOLD", 0.35)),
+            max_fresh_wallet_age=int(os.getenv("MAX_FRESH_WALLET_AGE", 45)),
+            size_anomaly_multiplier=float(os.getenv("SIZE_ANOMALY_MULTIPLIER", 2.0)),
+            timing_hours_before_end=int(os.getenv("TIMING_HOURS_BEFORE_END", 48)),
+            longshot_threshold=float(os.getenv("LONGSHOT_THRESHOLD", 0.50)),
             excluded_tag_ids=[int(x) for x in excluded.split(",") if x],
             stats_interval=int(os.getenv("STATS_INTERVAL", 15)),
         )
