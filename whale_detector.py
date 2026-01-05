@@ -43,6 +43,7 @@ MIN_CONCENTRATION = float(os.getenv("MIN_CONCENTRATION", 50))  # Min % of portfo
 MAX_MARKETS_TRADED = int(os.getenv("MAX_MARKETS_TRADED", 10))  # Max markets they've traded
 MIN_TRADES_ON_MARKET = int(os.getenv("MIN_TRADES_ON_MARKET", 3))  # Min trades on same market
 MIN_TOTAL_AMOUNT_ON_MARKET = int(os.getenv("MIN_TOTAL_AMOUNT_ON_MARKET", 5000))  # Min total $ on same market
+STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", 15))  # Seconds between stats prints
 
 # API endpoints
 DATA_API = "https://data-api.polymarket.com"
@@ -687,12 +688,12 @@ class WebSocketClient:
 
 
 def print_stats_periodically():
-    """Print stats every 60 seconds."""
+    """Print stats at configured interval."""
     while True:
-        time.sleep(60)
+        time.sleep(STATS_INTERVAL)
         print(f"\n[STATS] Received: {stats['trades_received']} | Processed: {stats['trades_processed']} | Excluded: {stats['skipped_excluded']} | Alerts: {stats['alerts_sent']}")
 
-        # Refresh excluded markets cache
+        # Refresh excluded markets cache (only every 60s minimum)
         refresh_excluded_markets()
 
 
