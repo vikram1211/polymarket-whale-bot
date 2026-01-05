@@ -190,20 +190,24 @@ class TradeContext:
 @dataclass
 class Stats:
     trades_received: int = 0
-    passed_size: int = 0
-    passed_market: int = 0
-    passed_odds: int = 0
-    passed_lp: int = 0
+    filtered_size: int = 0
+    filtered_odds: int = 0
+    filtered_market: int = 0
+    filtered_lp: int = 0
+    filtered_score: int = 0
     alerts_sent: int = 0
 
     def log(self):
+        qualified = (self.trades_received - self.filtered_size - self.filtered_odds
+                     - self.filtered_market - self.filtered_lp - self.filtered_score)
         log.info(
-            f"Trades Received: {self.trades_received} | "
-            f"Passed Size: {self.passed_size} | "
-            f"Passed Market: {self.passed_market} | "
-            f"Passed Odds: {self.passed_odds} | "
-            f"Passed LP Check: {self.passed_lp} | "
-            f"Alerts Sent: {self.alerts_sent}"
+            f"Received: {self.trades_received} | "
+            f"Size(<$2k): -{self.filtered_size} | "
+            f"Odds(>55%): -{self.filtered_odds} | "
+            f"Sports/Crypto: -{self.filtered_market} | "
+            f"LP: -{self.filtered_lp} | "
+            f"Low Score: -{self.filtered_score} | "
+            f"Alerts: {self.alerts_sent}"
         )
 
 
@@ -600,12 +604,13 @@ class TradeProcessor:
 
         # LP check
         if self.analyzer.is_liquidity_provider(ctx.positions, trade.condition_id):
+            self.stats.filtered_lp += 1
             return
-        self.stats.passed_lp += 1
 
         # Signal analysis
         score, signals = self.analyzer.analyze(ctx)
         if score < self.config.min_alert_score:
+            self.stats.filtered_score += 1
             return
 
         # Enrich with market info
@@ -620,13 +625,13 @@ class TradeProcessor:
     def _apply_filters(self, trade: Trade) -> bool:
         for name, filt in self.filters:
             if not filt(trade):
+                if name == "size":
+                    self.stats.filtered_size += 1
+                elif name == "odds":
+                    self.stats.filtered_odds += 1
+                elif name == "market":
+                    self.stats.filtered_market += 1
                 return False
-            if name == "size":
-                self.stats.passed_size += 1
-            elif name == "odds":
-                self.stats.passed_odds += 1
-            elif name == "market":
-                self.stats.passed_market += 1
         return True
 
     def _enrich(self, trade: Trade) -> TradeContext | None:
