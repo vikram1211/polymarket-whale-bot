@@ -418,12 +418,17 @@ def format_alert_message(analysis: dict) -> str:
         emoji = "📊"
         urgency = "LOW"
 
+    # Calculate decimal odds (sports betting format)
+    decimal_odds = (1 / trade['price']) if trade['price'] > 0 else 0
+
     message = f"""
 {emoji} <b>WHALE ALERT</b> [{urgency}]
 
 <b>Market:</b> {trade['market']}
 <b>Bet:</b> {trade['outcome']} ({trade['side']})
-<b>This Trade:</b> ${trade['amount']:,.2f} @ {trade['price']:.2f}
+<b>Odds:</b> {decimal_odds:.2f} ({trade['price']*100:.0f}% implied)
+<b>Shares:</b> {trade['size']:,.0f}
+<b>Cost:</b> ${trade['amount']:,.2f}
 
 <b>Activity on This Market:</b>
 • Total Trades: {market_activity['trades_on_market']}
