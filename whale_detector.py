@@ -333,8 +333,8 @@ def analyze_trade(trade: dict) -> dict | None:
     trade_price = float(trade.get("price", 0))
     market_id = trade.get("conditionId", "")
 
-    # Skip trades with <=50% implied probability
-    if trade_price <= 0.5:
+    # Skip trades with >50% implied probability (focus on longshots)
+    if trade_price > 0.5:
         return None
 
     # Get wallet profile
