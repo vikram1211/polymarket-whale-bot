@@ -17,8 +17,14 @@ from enum import Enum
 from typing import Callable
 
 import requests
-from cachetools import LRUCache, TTLCache
 from dotenv import load_dotenv
+
+try:
+    from cachetools import LRUCache, TTLCache
+except ImportError:
+    import subprocess
+    subprocess.check_call(["pip", "install", "cachetools"])
+    from cachetools import LRUCache, TTLCache
 
 try:
     import websocket
@@ -190,12 +196,12 @@ class Stats:
 
     def log(self):
         log.info(
-            f"Recv:{self.trades_received} | "
-            f"Size:{self.passed_size} | "
-            f"Mkt:{self.passed_market} | "
-            f"Odds:{self.passed_odds} | "
-            f"LP:{self.passed_lp} | "
-            f"Alerts:{self.alerts_sent}"
+            f"Trades Received: {self.trades_received} | "
+            f"Passed Size: {self.passed_size} | "
+            f"Passed Market: {self.passed_market} | "
+            f"Passed Odds: {self.passed_odds} | "
+            f"Passed LP Check: {self.passed_lp} | "
+            f"Alerts Sent: {self.alerts_sent}"
         )
 
 
