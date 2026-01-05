@@ -367,14 +367,6 @@ def analyze_trade(trade: dict) -> dict | None:
     Analyze a trade to determine if it's from a potential informed trader.
     Returns analysis dict if suspicious, None otherwise.
     """
-    # Track debug count
-    debug_count = stats.get("analyze_debug", 0)
-    should_debug = debug_count < 3
-    
-    def debug_log(msg):
-        if should_debug:
-            print(f"[ANALYZE] {msg}")
-    
     # Handle both REST API and WebSocket field names
     wallet = trade.get("proxyWallet") or trade.get("proxy_wallet")
     if not wallet:
@@ -386,72 +378,46 @@ def analyze_trade(trade: dict) -> dict | None:
     trade_amount = size * price
     market_id = trade.get("conditionId") or trade.get("condition_id", "")
 
-    if should_debug:
-        stats["analyze_debug"] = debug_count + 1
-        print(f"\n{'='*50}")
-        print(f"[ANALYZE] === Full Analysis #{debug_count + 1} ===")
-        print(f"[ANALYZE] Wallet: {wallet[:20]}...")
-        print(f"[ANALYZE] Trade: ${trade_amount:.2f} @ {price:.2f} ({price*100:.0f}% odds)")
-
     # Skip small trades
     if trade_amount < MIN_TRADE_AMOUNT:
-        debug_log(f"❌ SKIP: Trade ${trade_amount:.2f} < ${MIN_TRADE_AMOUNT} minimum")
         return None
 
     # Skip trades with >50% implied probability (focus on longshots)
     if price > 0.5:
-        debug_log(f"❌ SKIP: Price {price:.2f} > 0.50 (not a longshot)")
         return None
-    
-    debug_log(f"✓ Passed: Amount OK, Price OK (longshot)")
 
     # Get wallet profile
-    debug_log(f"📡 API: Fetching wallet profile...")
     profile = get_wallet_profile(wallet)
     if not profile:
-        debug_log(f"❌ SKIP: Could not fetch wallet profile")
         return None
-    debug_log(f"✓ API: Got profile - username: {profile.get('pseudonym', 'N/A')}")
 
     # Calculate account age
     account_age = calculate_account_age(profile)
-    debug_log(f"📊 Account age: {account_age} days (max allowed: {MAX_ACCOUNT_AGE_DAYS})")
 
     # Skip if account is too old
     if account_age > MAX_ACCOUNT_AGE_DAYS:
-        debug_log(f"❌ SKIP: Account {account_age} days old > {MAX_ACCOUNT_AGE_DAYS} max")
         return None
-    debug_log(f"✓ Passed: Account is new enough")
 
     # Get wallet's trade history on THIS specific market
-    debug_log(f"📡 API: Fetching trades on this market...")
     market_trades = get_wallet_trades_on_market(wallet, market_id)
     trades_on_market = market_trades["trade_count"]
     total_amount_on_market = market_trades["total_amount"]
-    debug_log(f"✓ API: {trades_on_market} trades, ${total_amount_on_market:.2f} total on this market")
 
     # Skip if not enough trades on this market
     if trades_on_market < MIN_TRADES_ON_MARKET:
-        debug_log(f"❌ SKIP: Only {trades_on_market} trades < {MIN_TRADES_ON_MARKET} required")
         return None
 
     # Skip if total amount on market is less than threshold
     if total_amount_on_market < MIN_TOTAL_AMOUNT_ON_MARKET:
-        debug_log(f"❌ SKIP: ${total_amount_on_market:.2f} < ${MIN_TOTAL_AMOUNT_ON_MARKET} required")
         return None
-    debug_log(f"✓ Passed: Market activity thresholds met")
 
     # Get positions and calculate concentration
-    debug_log(f"📡 API: Fetching wallet positions...")
     positions = get_wallet_positions(wallet)
     concentration = calculate_portfolio_concentration(positions, market_id)
-    debug_log(f"✓ API: {len(positions)} positions, {concentration:.1f}% in this market")
 
     # Get total markets traded
-    debug_log(f"📡 API: Fetching wallet stats...")
     wallet_stats = get_wallet_stats(wallet)
     markets_traded = wallet_stats.get("traded", 0) if wallet_stats else 0
-    debug_log(f"✓ API: Traded in {markets_traded} total markets")
 
     # Get market title
     market_title = trade.get("title") or trade.get("market_slug", "")
@@ -460,27 +426,13 @@ def analyze_trade(trade: dict) -> dict | None:
         market_title = market_info.get("question", "Unknown Market") if market_info else "Unknown Market"
 
     # Calculate a "whale score" (higher = more suspicious)
-    score_age = min(25, (MAX_ACCOUNT_AGE_DAYS - account_age) / 2)
-    score_concentration = min(25, concentration / 4)
-    score_amount = min(25, total_amount_on_market / 1000)
-    score_trades = min(15, trades_on_market * 3)
-    score_diversity = min(10, (MAX_MARKETS_TRADED - markets_traded)) if markets_traded < MAX_MARKETS_TRADED else 0
-    
-    whale_score = score_age + score_concentration + score_amount + score_trades + score_diversity
+    whale_score = 0
+    whale_score += min(25, (MAX_ACCOUNT_AGE_DAYS - account_age) / 2)  # Newer = higher score
+    whale_score += min(25, concentration / 4)  # Higher concentration = higher score
+    whale_score += min(25, total_amount_on_market / 1000)  # Larger total on market = higher score
+    whale_score += min(15, trades_on_market * 3)  # More trades on same market = higher score
+    whale_score += min(10, (MAX_MARKETS_TRADED - markets_traded)) if markets_traded < MAX_MARKETS_TRADED else 0
 
-    if should_debug:
-        print(f"[ANALYZE] --- Whale Score Breakdown ---")
-        print(f"[ANALYZE]   Age score:    {score_age:.1f}/25 (newer = higher)")
-        print(f"[ANALYZE]   Focus score:  {score_concentration:.1f}/25 (higher concentration = higher)")
-        print(f"[ANALYZE]   Amount score: {score_amount:.1f}/25 (more $ on market = higher)")
-        print(f"[ANALYZE]   Trades score: {score_trades:.1f}/15 (more trades = higher)")
-        print(f"[ANALYZE]   Diversity:    {score_diversity:.1f}/10 (less diverse = higher)")
-        print(f"[ANALYZE]   TOTAL SCORE:  {whale_score:.1f}/100 (threshold: 40)")
-        if whale_score >= 40:
-            print(f"[ANALYZE] 🚨 WHALE DETECTED! Score >= 40")
-        else:
-            print(f"[ANALYZE] ⚪ Not a whale. Score < 40")
-        print(f"{'='*50}\n")
 
     return {
         "wallet": wallet,
@@ -593,17 +545,6 @@ def process_trade(trade_data: dict) -> None:
         stats["skipped_excluded"] += 1
         return
 
-    # DEBUG: Log first 3 non-excluded trades that go to whale analysis
-    debug_count = stats.get("debug_logged", 0)
-    if debug_count < 3:
-        stats["debug_logged"] = debug_count + 1
-        print(f"\n[DEBUG] === Eligible Trade #{debug_count + 1} (passed all filters) ===")
-        print(f"[DEBUG] Amount: ${trade_amount:.2f} | Price: {price:.2f} ({price*100:.0f}% odds)")
-        print(f"[DEBUG] Wallet: {trade_data.get('proxy_wallet') or trade_data.get('proxyWallet', 'N/A')}")
-        print(f"[DEBUG] Market: {trade_data.get('market_slug') or trade_data.get('slug', 'N/A')}")
-        print(f"[DEBUG] Side: {trade_data.get('side', 'N/A')}, Outcome: {trade_data.get('outcome', 'N/A')}")
-        print(f"[DEBUG] Now analyzing wallet profile & whale score...")
-        print(f"[DEBUG] =============================\n")
 
     # Normalize field names for analyze_trade
     normalized_trade = {
