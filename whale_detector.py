@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -38,7 +39,8 @@ load_dotenv()
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S"
+    datefmt="%H:%M:%S",
+    stream=sys.stdout
 )
 log = logging.getLogger(__name__)
 
