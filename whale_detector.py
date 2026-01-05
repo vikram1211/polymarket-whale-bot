@@ -38,9 +38,15 @@ MIN_TOTAL_AMOUNT_ON_MARKET = int(os.getenv("MIN_TOTAL_AMOUNT_ON_MARKET", 5000)) 
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 
+# Excluded market categories (tag IDs from Polymarket)
+# Tag 1 = Sports, Tag 235 = Bitcoin/Crypto
+EXCLUDED_TAG_IDS = [int(x) for x in os.getenv("EXCLUDED_TAG_IDS", "1,235").split(",")]
+EXCLUDED_CACHE_TTL = int(os.getenv("EXCLUDED_CACHE_TTL", 3600))  # Refresh excluded markets every hour
+
 # Cache to avoid redundant API calls and duplicate alerts
 wallet_cache = {}  # wallet -> {profile, positions, last_updated}
 seen_trades = set()  # Set of transaction hashes we've already processed
+excluded_markets_cache = {"condition_ids": set(), "last_updated": 0}  # Excluded market condition IDs
 
 
 def send_telegram_message(message: str) -> bool:
@@ -71,6 +77,72 @@ def send_telegram_message(message: str) -> bool:
     except Exception as e:
         print(f"[TELEGRAM ERROR] Exception: {e}")
         return False
+
+
+def get_markets_by_tag(tag_id: int) -> set:
+    """Fetch all market condition IDs for a given tag."""
+    condition_ids = set()
+    offset = 0
+    limit = 100
+
+    while True:
+        url = f"{GAMMA_API}/markets"
+        params = {
+            "tag_id": tag_id,
+            "limit": limit,
+            "offset": offset,
+            "closed": "false"  # Only active markets
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=30)
+            if response.status_code == 200:
+                markets = response.json()
+                if not markets:
+                    break
+
+                for market in markets:
+                    cond_id = market.get("conditionId")
+                    if cond_id:
+                        condition_ids.add(cond_id)
+
+                if len(markets) < limit:
+                    break
+                offset += limit
+            else:
+                print(f"[ERROR] Failed to fetch markets for tag {tag_id}: {response.status_code}")
+                break
+        except Exception as e:
+            print(f"[ERROR] Failed to fetch markets for tag {tag_id}: {e}")
+            break
+
+    return condition_ids
+
+
+def refresh_excluded_markets() -> None:
+    """Refresh the cache of excluded market condition IDs."""
+    global excluded_markets_cache
+
+    # Check if cache is still valid
+    if time.time() - excluded_markets_cache["last_updated"] < EXCLUDED_CACHE_TTL:
+        return
+
+    print(f"[INFO] Refreshing excluded markets cache for tags: {EXCLUDED_TAG_IDS}")
+    all_excluded = set()
+
+    for tag_id in EXCLUDED_TAG_IDS:
+        condition_ids = get_markets_by_tag(tag_id)
+        print(f"[INFO] Found {len(condition_ids)} markets for tag {tag_id}")
+        all_excluded.update(condition_ids)
+
+    excluded_markets_cache["condition_ids"] = all_excluded
+    excluded_markets_cache["last_updated"] = time.time()
+    print(f"[INFO] Total excluded markets: {len(all_excluded)}")
+
+
+def is_excluded_market(condition_id: str) -> bool:
+    """Check if a market is in the excluded categories."""
+    return condition_id in excluded_markets_cache["condition_ids"]
 
 
 def get_large_trades(min_amount: int = 500, limit: int = 100) -> list:
@@ -382,18 +454,27 @@ def run_detector():
     print(f"  • Min Concentration: {MIN_CONCENTRATION}%")
     print(f"  • Max Markets Traded: {MAX_MARKETS_TRADED}")
     print(f"  • Poll Interval: {POLL_INTERVAL}s")
+    print(f"  • Excluded Tags: {EXCLUDED_TAG_IDS} (Sports=1, Crypto=235)")
     print("=" * 60)
 
+    # Load excluded markets cache
+    print("[INFO] Loading excluded markets (sports, crypto)...")
+    refresh_excluded_markets()
+
     # Send startup message
-    send_telegram_message("🐋 Whale Detector Bot Started!\n\nMonitoring Polymarket for suspicious large trades...")
+    send_telegram_message("🐋 Whale Detector Bot Started!\n\nMonitoring Polymarket for suspicious large trades (excluding sports & crypto)...")
 
     while True:
         try:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Fetching trades...")
 
+            # Refresh excluded markets cache periodically
+            refresh_excluded_markets()
+
             # Fetch large trades
             trades = get_large_trades(min_amount=MIN_TRADE_AMOUNT)
             new_trades = 0
+            skipped_excluded = 0
             alerts_sent = 0
 
             for trade in trades:
@@ -409,6 +490,12 @@ def run_detector():
                 # Keep seen_trades from growing indefinitely
                 if len(seen_trades) > 10000:
                     seen_trades.clear()
+
+                # Skip excluded markets (sports, crypto)
+                condition_id = trade.get("conditionId", "")
+                if is_excluded_market(condition_id):
+                    skipped_excluded += 1
+                    continue
 
                 # Analyze the trade
                 analysis = analyze_trade(trade)
@@ -427,7 +514,7 @@ def run_detector():
                     if send_telegram_message(message):
                         alerts_sent += 1
 
-            print(f"Processed {new_trades} new trades, sent {alerts_sent} alerts")
+            print(f"Processed {new_trades} new trades, skipped {skipped_excluded} (sports/crypto), sent {alerts_sent} alerts")
 
             # Wait before next poll
             time.sleep(POLL_INTERVAL)
