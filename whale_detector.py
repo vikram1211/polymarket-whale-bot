@@ -531,18 +531,6 @@ def process_trade(trade_data: dict) -> None:
     price = float(trade_data.get("price", 0))
     trade_amount = size * price
 
-    # DEBUG: Log first 3 processed trades to verify everything works
-    if stats["trades_processed"] < 3 and trade_amount >= MIN_TRADE_AMOUNT:
-        print(f"\n[DEBUG] === Trade #{stats['trades_processed'] + 1} Sample ===")
-        print(f"[DEBUG] Raw data: size={size}, price={price}, amount=${trade_amount:.2f}")
-        print(f"[DEBUG] Wallet: {trade_data.get('proxy_wallet') or trade_data.get('proxyWallet', 'N/A')}")
-        print(f"[DEBUG] Market: {trade_data.get('market_slug') or trade_data.get('slug', 'N/A')}")
-        print(f"[DEBUG] Side: {trade_data.get('side', 'N/A')}, Outcome: {trade_data.get('outcome', 'N/A')}")
-        condition_id_debug = trade_data.get("condition_id") or trade_data.get("conditionId", "")
-        is_excluded = is_excluded_market(condition_id_debug)
-        print(f"[DEBUG] Condition ID: {condition_id_debug[:20]}... | Excluded: {is_excluded}")
-        print(f"[DEBUG] =============================\n")
-
     # Skip small trades early
     if trade_amount < MIN_TRADE_AMOUNT:
         return
@@ -554,6 +542,18 @@ def process_trade(trade_data: dict) -> None:
     if is_excluded_market(condition_id):
         stats["skipped_excluded"] += 1
         return
+
+    # DEBUG: Log first 3 non-excluded trades that go to whale analysis
+    debug_count = stats.get("debug_logged", 0)
+    if debug_count < 3:
+        stats["debug_logged"] = debug_count + 1
+        print(f"\n[DEBUG] === Eligible Trade #{debug_count + 1} (passed all filters) ===")
+        print(f"[DEBUG] Amount: ${trade_amount:.2f} | Price: {price:.2f} ({price*100:.0f}% odds)")
+        print(f"[DEBUG] Wallet: {trade_data.get('proxy_wallet') or trade_data.get('proxyWallet', 'N/A')}")
+        print(f"[DEBUG] Market: {trade_data.get('market_slug') or trade_data.get('slug', 'N/A')}")
+        print(f"[DEBUG] Side: {trade_data.get('side', 'N/A')}, Outcome: {trade_data.get('outcome', 'N/A')}")
+        print(f"[DEBUG] Now analyzing wallet profile & whale score...")
+        print(f"[DEBUG] =============================\n")
 
     # Normalize field names for analyze_trade
     normalized_trade = {
