@@ -1,595 +1,763 @@
 """
-Polymarket Whale Detector Bot (v2)
-New algorithm with LP detection, signal-based filtering, and rate limiting.
-Sends alerts via Telegram.
+Polymarket Whale Detector v3
+Clean architecture with weighted signal scoring.
 """
 
-import os
-import time
+from __future__ import annotations
+
 import json
+import logging
+import math
+import os
 import threading
-import requests
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from collections import deque
+from enum import Enum
+from typing import Callable
+
+import requests
+from cachetools import LRUCache, TTLCache
 from dotenv import load_dotenv
 
 try:
     import websocket
 except ImportError:
-    print("Installing websocket-client...")
     import subprocess
     subprocess.check_call(["pip", "install", "websocket-client"])
     import websocket
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+
+# =============================================================================
 # Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+# =============================================================================
 
-# Debug: Print what we loaded (masked for security)
-def mask_token(token):
-    if not token or len(token) < 10:
-        return f"EMPTY or TOO SHORT (len={len(token) if token else 0})"
-    return f"{token[:8]}...{token[-4:]} (len={len(token)})"
+@dataclass
+class Config:
+    """All configuration loaded from environment."""
+    # Telegram
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_rate_limit: float = 1.0
 
-print(f"[CONFIG] TELEGRAM_BOT_TOKEN: {mask_token(TELEGRAM_BOT_TOKEN)}")
-print(f"[CONFIG] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
+    # Detection thresholds
+    min_trade_size: int = 2000
+    max_account_age_days: int = 45
+    min_odds: float = 1.8
+    min_alert_score: int = 40
 
-# Detection thresholds
-MIN_TRADE_SIZE = int(os.getenv("MIN_TRADE_SIZE", 2000))  # Minimum trade size in USD
-MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 45))  # Fresh wallet threshold (was 30)
-MIN_ODDS = float(os.getenv("MIN_ODDS", 1.8))  # Minimum decimal odds (1.8 = 55.5% or less)
-STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", 15))  # Seconds between stats prints
+    # Market exclusions
+    excluded_tag_ids: list[int] = field(default_factory=lambda: [1, 235])
+    excluded_cache_ttl: int = 3600
 
-# API endpoints
-DATA_API = "https://data-api.polymarket.com"
-GAMMA_API = "https://gamma-api.polymarket.com"
-RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+    # Cache sizes
+    wallet_cache_size: int = 10000
+    wallet_cache_ttl: int = 3600
+    position_cache_ttl: int = 300
+    dedup_cache_size: int = 100000
 
-# Excluded market categories (tag IDs from Polymarket)
-EXCLUDED_TAG_IDS = [int(x) for x in os.getenv("EXCLUDED_TAG_IDS", "1,235").split(",")]
-EXCLUDED_CACHE_TTL = int(os.getenv("EXCLUDED_CACHE_TTL", 3600))
+    # Operational
+    stats_interval: int = 15
+    ws_stale_threshold: int = 30
 
-# Caches
-wallet_cache = {}
-seen_trades = set()
-excluded_markets_cache = {"condition_ids": set(), "last_updated": 0}
-
-# Rate limiting for Telegram
-telegram_queue = deque()
-last_telegram_send = 0
-TELEGRAM_RATE_LIMIT = 1.0  # seconds between messages
-
-# Stats
-stats = {
-    "trades_received": 0,
-    "size_filtered": 0,
-    "excluded_market": 0,
-    "odds_filtered": 0,
-    "lp_filtered": 0,
-    "no_signals": 0,
-    "alerts_sent": 0
-}
+    @classmethod
+    def from_env(cls) -> Config:
+        excluded = os.getenv("EXCLUDED_TAG_IDS", "1,235")
+        return cls(
+            telegram_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            min_trade_size=int(os.getenv("MIN_TRADE_SIZE", 2000)),
+            max_account_age_days=int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 45)),
+            min_odds=float(os.getenv("MIN_ODDS", 1.8)),
+            min_alert_score=int(os.getenv("MIN_ALERT_SCORE", 40)),
+            excluded_tag_ids=[int(x) for x in excluded.split(",") if x],
+            stats_interval=int(os.getenv("STATS_INTERVAL", 15)),
+        )
 
 
-def send_telegram_message(message: str) -> bool:
-    """Send a message via Telegram bot with rate limiting."""
-    global last_telegram_send
-    
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[TELEGRAM] Missing credentials, logging instead:")
-        print(message[:200] + "..." if len(message) > 200 else message)
-        return False
+# =============================================================================
+# Data Models
+# =============================================================================
 
-    # Rate limiting
-    now = time.time()
-    wait_time = TELEGRAM_RATE_LIMIT - (now - last_telegram_send)
-    if wait_time > 0:
-        time.sleep(wait_time)
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
-
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        last_telegram_send = time.time()
-        if response.status_code == 200:
-            print(f"[TELEGRAM] Alert sent!")
-            return True
-        else:
-            print(f"[TELEGRAM ERROR] Status: {response.status_code}")
-            return False
-    except Exception as e:
-        print(f"[TELEGRAM ERROR] {e}")
-        return False
+class SignalType(Enum):
+    FRESH_WALLET = "fresh_wallet"
+    LARGE_TRADE = "large_trade"
+    CONTRARIAN = "contrarian"
+    CONCENTRATED = "concentrated"
+    FIRST_TRADE = "first_trade"
 
 
-def get_markets_by_tag(tag_id: int) -> set:
-    """Fetch all market condition IDs for a given tag."""
-    condition_ids = set()
-    offset = 0
-    limit = 100
+@dataclass
+class Signal:
+    type: SignalType
+    score: float
+    detail: str
 
-    while True:
+
+@dataclass
+class Trade:
+    """Normalized trade from WebSocket."""
+    tx_hash: str
+    condition_id: str
+    market_slug: str
+    wallet: str
+    side: str
+    outcome: str
+    size: float
+    price: float
+
+    @property
+    def amount_usd(self) -> float:
+        return self.size * self.price
+
+    @property
+    def decimal_odds(self) -> float:
+        return 1 / self.price if self.price > 0 else 0
+
+    @property
+    def implied_prob(self) -> float:
+        return self.price * 100
+
+    @classmethod
+    def from_ws_payload(cls, data: dict) -> Trade | None:
+        wallet = data.get("proxy_wallet") or data.get("proxyWallet")
+        if not wallet:
+            return None
+        return cls(
+            tx_hash=data.get("transaction_hash", ""),
+            condition_id=data.get("condition_id") or data.get("conditionId", ""),
+            market_slug=data.get("market_slug") or data.get("slug", ""),
+            wallet=wallet,
+            side=data.get("side", ""),
+            outcome=data.get("outcome", ""),
+            size=float(data.get("size", 0)),
+            price=float(data.get("price", 0)),
+        )
+
+
+@dataclass
+class WalletProfile:
+    address: str
+    username: str
+    age_days: int
+    created_at: datetime | None
+
+
+@dataclass
+class TradeContext:
+    """Enriched trade with wallet data."""
+    trade: Trade
+    profile: WalletProfile
+    positions: list[dict]
+    market_info: dict | None = None
+
+    @property
+    def market_value(self) -> float:
+        return sum(
+            abs(float(p.get("currentValue", 0)))
+            for p in self.positions
+            if p.get("conditionId") == self.trade.condition_id
+        )
+
+    @property
+    def total_value(self) -> float:
+        return sum(abs(float(p.get("currentValue", 0))) for p in self.positions)
+
+    @property
+    def concentration(self) -> float:
+        if self.total_value == 0:
+            return 0
+        return self.market_value / self.total_value
+
+
+@dataclass
+class Stats:
+    trades_received: int = 0
+    passed_size: int = 0
+    passed_market: int = 0
+    passed_odds: int = 0
+    passed_lp: int = 0
+    alerts_sent: int = 0
+
+    def log(self):
+        log.info(
+            f"Recv:{self.trades_received} | "
+            f"Size:{self.passed_size} | "
+            f"Mkt:{self.passed_market} | "
+            f"Odds:{self.passed_odds} | "
+            f"LP:{self.passed_lp} | "
+            f"Alerts:{self.alerts_sent}"
+        )
+
+
+# =============================================================================
+# API Client with Caching
+# =============================================================================
+
+class PolymarketAPI:
+    DATA_API = "https://data-api.polymarket.com"
+    GAMMA_API = "https://gamma-api.polymarket.com"
+
+    def __init__(self, config: Config):
+        self.config = config
+        self._profile_cache: TTLCache = TTLCache(
+            maxsize=config.wallet_cache_size,
+            ttl=config.wallet_cache_ttl
+        )
+        self._position_cache: TTLCache = TTLCache(
+            maxsize=config.wallet_cache_size,
+            ttl=config.position_cache_ttl
+        )
+        self._market_cache: TTLCache = TTLCache(maxsize=5000, ttl=3600)
+        self._excluded_markets: set[str] = set()
+        self._excluded_loaded = False
+
+    def get_profile(self, wallet: str) -> WalletProfile | None:
+        if wallet in self._profile_cache:
+            return self._profile_cache[wallet]
+
         try:
-            response = requests.get(
-                f"{GAMMA_API}/markets",
-                params={"tag_id": tag_id, "limit": limit, "offset": offset, "closed": "false"},
-                timeout=30
+            resp = requests.get(
+                f"{self.GAMMA_API}/public-profile",
+                params={"address": wallet},
+                timeout=10
             )
-            if response.status_code == 200:
-                markets = response.json()
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            age = self._calc_age(data.get("createdAt"))
+            profile = WalletProfile(
+                address=wallet,
+                username=data.get("pseudonym") or data.get("name") or "Unknown",
+                age_days=age,
+                created_at=self._parse_date(data.get("createdAt"))
+            )
+            self._profile_cache[wallet] = profile
+            return profile
+        except Exception:
+            return None
+
+    def get_positions(self, wallet: str) -> list[dict]:
+        if wallet in self._position_cache:
+            return self._position_cache[wallet]
+
+        try:
+            resp = requests.get(
+                f"{self.DATA_API}/positions",
+                params={"user": wallet, "limit": 100},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                positions = resp.json()
+                self._position_cache[wallet] = positions
+                return positions
+        except Exception:
+            pass
+        return []
+
+    def get_market_info(self, condition_id: str) -> dict | None:
+        if condition_id in self._market_cache:
+            return self._market_cache[condition_id]
+
+        try:
+            resp = requests.get(
+                f"{self.GAMMA_API}/markets",
+                params={"condition_id": condition_id},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                markets = resp.json()
+                if markets:
+                    self._market_cache[condition_id] = markets[0]
+                    return markets[0]
+        except Exception:
+            pass
+        return None
+
+    def get_trade_count(self, wallet: str, market_id: str) -> int:
+        """Get number of trades wallet has made on this market."""
+        try:
+            resp = requests.get(
+                f"{self.DATA_API}/trades",
+                params={"user": wallet, "market": market_id, "limit": 100},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return len(resp.json())
+        except Exception:
+            pass
+        return 0
+
+    def is_excluded_market(self, condition_id: str) -> bool:
+        if not self._excluded_loaded:
+            self._load_excluded_markets()
+        return condition_id in self._excluded_markets
+
+    def _load_excluded_markets(self):
+        log.info(f"Loading excluded markets for tags: {self.config.excluded_tag_ids}")
+        for tag_id in self.config.excluded_tag_ids:
+            count = self._load_tag_markets(tag_id)
+            log.info(f"Tag {tag_id}: {count} markets excluded")
+        log.info(f"Total excluded: {len(self._excluded_markets)}")
+        self._excluded_loaded = True
+
+    def _load_tag_markets(self, tag_id: int) -> int:
+        count = 0
+        offset = 0
+        while True:
+            try:
+                resp = requests.get(
+                    f"{self.GAMMA_API}/markets",
+                    params={"tag_id": tag_id, "limit": 100, "offset": offset, "closed": "false"},
+                    timeout=30
+                )
+                if resp.status_code != 200:
+                    break
+                markets = resp.json()
                 if not markets:
                     break
-                for market in markets:
-                    cond_id = market.get("conditionId")
-                    if cond_id:
-                        condition_ids.add(cond_id)
-                if len(markets) < limit:
+                for m in markets:
+                    cid = m.get("conditionId")
+                    if cid:
+                        self._excluded_markets.add(cid)
+                        count += 1
+                if len(markets) < 100:
                     break
-                offset += limit
-            else:
+                offset += 100
+            except Exception:
                 break
-        except Exception as e:
-            print(f"[ERROR] Failed to fetch markets for tag {tag_id}: {e}")
-            break
+        return count
 
-    return condition_ids
+    @staticmethod
+    def _calc_age(created_at: str | None) -> int:
+        if not created_at:
+            return 9999
+        try:
+            dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt).days
+        except Exception:
+            return 9999
 
-
-def refresh_excluded_markets():
-    """Refresh the cache of excluded market condition IDs."""
-    global excluded_markets_cache
-
-    if time.time() - excluded_markets_cache["last_updated"] < EXCLUDED_CACHE_TTL:
-        return
-
-    print(f"[INFO] Refreshing excluded markets cache for tags: {EXCLUDED_TAG_IDS}")
-    all_excluded = set()
-
-    for tag_id in EXCLUDED_TAG_IDS:
-        condition_ids = get_markets_by_tag(tag_id)
-        print(f"[INFO] Found {len(condition_ids)} markets for tag {tag_id}")
-        all_excluded.update(condition_ids)
-
-    excluded_markets_cache["condition_ids"] = all_excluded
-    excluded_markets_cache["last_updated"] = time.time()
-    print(f"[INFO] Total excluded markets: {len(all_excluded)}")
+    @staticmethod
+    def _parse_date(created_at: str | None) -> datetime | None:
+        if not created_at:
+            return None
+        try:
+            return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except Exception:
+            return None
 
 
-def is_excluded_market(condition_id: str) -> bool:
-    """Check if a market is in the excluded categories."""
-    return condition_id in excluded_markets_cache["condition_ids"]
+# =============================================================================
+# Filters
+# =============================================================================
+
+class Filter:
+    """Base filter - returns True to PASS, False to REJECT."""
+    def __call__(self, trade: Trade) -> bool:
+        raise NotImplementedError
 
 
-def get_wallet_profile(wallet: str) -> dict | None:
-    """Get wallet profile including creation date."""
-    if wallet in wallet_cache:
-        cached = wallet_cache[wallet]
-        if time.time() - cached.get("last_updated", 0) < 3600:
-            return cached.get("profile")
+class SizeFilter(Filter):
+    def __init__(self, min_usd: float):
+        self.min_usd = min_usd
 
-    try:
-        response = requests.get(
-            f"{GAMMA_API}/public-profile",
-            params={"address": wallet},
-            timeout=10
+    def __call__(self, trade: Trade) -> bool:
+        return trade.amount_usd >= self.min_usd
+
+
+class OddsFilter(Filter):
+    def __init__(self, min_odds: float):
+        self.min_odds = min_odds
+
+    def __call__(self, trade: Trade) -> bool:
+        return trade.decimal_odds >= self.min_odds
+
+
+class MarketFilter(Filter):
+    def __init__(self, api: PolymarketAPI):
+        self.api = api
+
+    def __call__(self, trade: Trade) -> bool:
+        return not self.api.is_excluded_market(trade.condition_id)
+
+
+# =============================================================================
+# Signal Analyzer
+# =============================================================================
+
+class SignalAnalyzer:
+    """Weighted scoring for whale signals."""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def analyze(self, ctx: TradeContext) -> tuple[float, list[Signal]]:
+        signals: list[Signal] = []
+
+        # Fresh wallet (0-30 points)
+        age = ctx.profile.age_days
+        if age <= self.config.max_account_age_days:
+            score = 30 * (1 - age / self.config.max_account_age_days)
+            signals.append(Signal(
+                SignalType.FRESH_WALLET, score,
+                f"{age}d old"
+            ))
+
+        # Large trade (0-25 points, log scale)
+        amount = ctx.trade.amount_usd
+        if amount >= self.config.min_trade_size:
+            # Log scale: $2k=0, $5k=10, $10k=17, $50k=25
+            ratio = amount / self.config.min_trade_size
+            score = min(25, 10 * math.log2(ratio))
+            if score >= 5:
+                signals.append(Signal(
+                    SignalType.LARGE_TRADE, score,
+                    f"${amount:,.0f}"
+                ))
+
+        # Contrarian bet (0-20 points)
+        price = ctx.trade.price
+        if price < 0.5:
+            score = min(20, (0.5 - price) * 40)
+            signals.append(Signal(
+                SignalType.CONTRARIAN, score,
+                f"{price*100:.0f}% odds"
+            ))
+
+        # Concentrated portfolio (0-15 points)
+        conc = ctx.concentration
+        if conc > 0.5:
+            score = min(15, (conc - 0.5) * 30)
+            signals.append(Signal(
+                SignalType.CONCENTRATED, score,
+                f"{conc*100:.0f}% portfolio"
+            ))
+
+        # First trade on market (10 points)
+        # This is checked via positions - if no position exists yet, it's first trade
+        if ctx.market_value == 0:
+            signals.append(Signal(
+                SignalType.FIRST_TRADE, 10,
+                "first position"
+            ))
+
+        total = sum(s.score for s in signals)
+        return total, signals
+
+    def is_liquidity_provider(self, positions: list[dict], condition_id: str) -> bool:
+        """Check if wallet has balanced YES/NO positions (LP behavior)."""
+        market_pos = [p for p in positions if p.get("conditionId") == condition_id]
+        if len(market_pos) < 2:
+            return False
+
+        yes_val = sum(
+            abs(float(p.get("currentValue", 0)))
+            for p in market_pos if "yes" in p.get("outcome", "").lower()
         )
-        if response.status_code == 200:
-            profile = response.json()
-            if wallet not in wallet_cache:
-                wallet_cache[wallet] = {}
-            wallet_cache[wallet]["profile"] = profile
-            wallet_cache[wallet]["last_updated"] = time.time()
-            return profile
-        return None
-    except Exception:
-        return None
-
-
-def get_wallet_positions(wallet: str) -> list:
-    """Get wallet's current positions."""
-    try:
-        response = requests.get(
-            f"{DATA_API}/positions",
-            params={"user": wallet, "limit": 100},
-            timeout=10
+        no_val = sum(
+            abs(float(p.get("currentValue", 0)))
+            for p in market_pos if "no" in p.get("outcome", "").lower()
         )
-        if response.status_code == 200:
-            return response.json()
-        return []
-    except Exception:
-        return []
 
-
-def get_wallet_trades_on_market(wallet: str, market_id: str) -> dict:
-    """
-    Get wallet's trade history on a specific market.
-    Returns: {"trade_count": int, "total_amount": float}
-    """
-    try:
-        response = requests.get(
-            f"{DATA_API}/trades",
-            params={"user": wallet, "market": market_id, "limit": 100},
-            timeout=10
-        )
-        if response.status_code == 200:
-            trades = response.json()
-            trade_count = len(trades)
-            total_amount = 0
-            for t in trades:
-                size = float(t.get("size", 0))
-                price = float(t.get("price", 0))
-                total_amount += size * price
-            return {"trade_count": trade_count, "total_amount": total_amount}
-        return {"trade_count": 0, "total_amount": 0}
-    except Exception:
-        return {"trade_count": 0, "total_amount": 0}
-
-
-def calculate_account_age(profile: dict) -> int:
-    """Calculate account age in days."""
-    created_at = profile.get("createdAt")
-    if not created_at:
-        return 9999
-
-    try:
-        created_date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-        now = datetime.now(timezone.utc)
-        return (now - created_date).days
-    except Exception:
-        return 9999
-
-
-def is_liquidity_provider(wallet: str, condition_id: str) -> bool:
-    """
-    Check if wallet appears to be a liquidity provider.
-    LPs typically have balanced YES/NO positions.
-    """
-    positions = get_wallet_positions(wallet)
-    
-    # Find positions in this market
-    market_positions = [p for p in positions if p.get("conditionId") == condition_id]
-    
-    if len(market_positions) < 2:
+        if yes_val > 100 and no_val > 100:
+            ratio = min(yes_val, no_val) / max(yes_val, no_val)
+            return ratio > 0.5
         return False
-    
-    # Check if they have both YES and NO positions that are roughly balanced
-    yes_value = 0
-    no_value = 0
-    
-    for pos in market_positions:
-        outcome = pos.get("outcome", "").lower()
-        value = abs(float(pos.get("currentValue", 0)))
-        
-        if "yes" in outcome:
-            yes_value += value
-        elif "no" in outcome:
-            no_value += value
-    
-    # If both sides have significant value and are within 50% of each other, likely LP
-    if yes_value > 100 and no_value > 100:
-        ratio = min(yes_value, no_value) / max(yes_value, no_value)
-        if ratio > 0.5:  # Within 50% = balanced = likely LP
-            return True
-    
-    return False
 
 
-def detect_signals(trade_data: dict, profile: dict, positions: list) -> list:
-    """
-    Detect trading signals that indicate potential informed trading.
-    Returns list of detected signal names.
-    """
-    signals = []
-    
-    # Signal 1: Fresh wallet
-    account_age = calculate_account_age(profile)
-    if account_age <= MAX_ACCOUNT_AGE_DAYS:
-        signals.append(f"fresh_wallet ({account_age}d)")
-    
-    # Signal 2: Size anomaly (large trade relative to typical)
-    trade_size = float(trade_data.get("size", 0)) * float(trade_data.get("price", 0))
-    if trade_size >= 5000:
-        signals.append(f"large_trade (${trade_size:,.0f})")
-    
-    # Signal 3: Contrarian bet (betting on low odds)
-    price = float(trade_data.get("price", 0))
-    if price < 0.30:  # Betting on <30% odds
-        signals.append(f"contrarian ({price*100:.0f}%)")
-    
-    # Signal 4: High concentration (most of portfolio in one market)
-    condition_id = trade_data.get("condition_id") or trade_data.get("conditionId", "")
-    total_value = sum(abs(float(p.get("currentValue", 0))) for p in positions)
-    market_value = sum(
-        abs(float(p.get("currentValue", 0))) 
-        for p in positions 
-        if p.get("conditionId") == condition_id
-    )
-    if total_value > 0 and market_value / total_value > 0.7:
-        signals.append(f"concentrated ({market_value/total_value*100:.0f}%)")
-    
-    return signals
+# =============================================================================
+# Telegram Alerter
+# =============================================================================
 
+class TelegramAlerter:
+    def __init__(self, config: Config):
+        self.config = config
+        self._last_send = 0.0
+        self._lock = threading.Lock()
 
-def get_market_info(condition_id: str) -> dict | None:
-    """Fetch market info to get the title."""
-    try:
-        response = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"condition_id": condition_id},
-            timeout=10
+    def send(self, message: str) -> bool:
+        if not self.config.telegram_token or not self.config.telegram_chat_id:
+            log.warning("Telegram not configured, logging alert instead")
+            print(message[:300])
+            return False
+
+        with self._lock:
+            wait = self.config.telegram_rate_limit - (time.time() - self._last_send)
+            if wait > 0:
+                time.sleep(wait)
+
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{self.config.telegram_token}/sendMessage",
+                    json={
+                        "chat_id": self.config.telegram_chat_id,
+                        "text": message,
+                        "parse_mode": "HTML"
+                    },
+                    timeout=10
+                )
+                self._last_send = time.time()
+                return resp.status_code == 200
+            except Exception as e:
+                log.error(f"Telegram send failed: {e}")
+                return False
+
+    def format_alert(self, ctx: TradeContext, score: float, signals: list[Signal]) -> str:
+        trade = ctx.trade
+        market_title = ctx.market_info.get("question", "Unknown") if ctx.market_info else "Unknown"
+
+        signal_lines = "\n".join(
+            f"  • {s.type.value}: {s.detail} (+{s.score:.0f})"
+            for s in sorted(signals, key=lambda x: -x.score)
         )
-        if response.status_code == 200:
-            markets = response.json()
-            if markets and len(markets) > 0:
-                return markets[0]
-        return None
-    except Exception:
-        return None
 
-
-def format_alert(trade_data: dict, profile: dict, signals: list, market_info: dict, market_activity: dict) -> str:
-    """Format the alert message for Telegram."""
-    size = float(trade_data.get("size", 0))
-    price = float(trade_data.get("price", 0))
-    trade_amount = size * price
-    
-    # Calculate odds
-    decimal_odds = (1 / price) if price > 0 else 0
-    
-    # Get market title
-    market_title = market_info.get("question", "Unknown Market") if market_info else "Unknown Market"
-    
-    # Account age
-    account_age = calculate_account_age(profile)
-    username = profile.get("pseudonym") or profile.get("name") or "Unknown"
-    
-    # Format signals
-    signal_list = "\n".join([f"  • {s}" for s in signals])
-    
-    # Market activity
-    total_trades = market_activity.get("trade_count", 0)
-    total_invested = market_activity.get("total_amount", 0)
-    
-    message = f"""
-🚨 <b>WHALE ALERT</b>
+        return f"""
+🐋 <b>WHALE ALERT</b> (Score: {score:.0f})
 
 <b>Market:</b> {market_title}
-<b>Bet:</b> {trade_data.get('outcome', 'Unknown')} ({trade_data.get('side', 'Unknown')})
-<b>Odds:</b> {decimal_odds:.2f} ({price*100:.0f}% implied)
-<b>Size:</b> {size:,.0f} shares
-<b>Cost:</b> ${trade_amount:,.2f}
+<b>Bet:</b> {trade.outcome} ({trade.side})
+<b>Odds:</b> {trade.decimal_odds:.2f} ({trade.implied_prob:.0f}% implied)
+<b>Size:</b> {trade.size:,.0f} shares
+<b>Cost:</b> ${trade.amount_usd:,.2f}
 
-<b>Trader:</b>
-  • Username: {username}
-  • Account Age: {account_age} days
-
-<b>Activity on This Market:</b>
-  • Total Trades: {total_trades}
-  • Total Invested: ${total_invested:,.2f}
+<b>Trader:</b> {ctx.profile.username}
+<b>Account Age:</b> {ctx.profile.age_days} days
 
 <b>Signals:</b>
-{signal_list}
+{signal_lines}
 
-🔗 <a href="https://polygonscan.com/tx/{trade_data.get('transaction_hash', '')}">View TX</a>
-"""
-    return message.strip()
+🔗 <a href="https://polygonscan.com/tx/{trade.tx_hash}">View TX</a>
+""".strip()
 
 
-def process_trade(trade_data: dict) -> None:
-    """Process a single trade through the detection pipeline."""
-    global stats
-    
-    stats["trades_received"] += 1
-    
-    # Dedup
-    trade_id = f"{trade_data.get('transaction_hash', '')}-{trade_data.get('asset', '')}"
-    if trade_id in seen_trades:
-        return
-    seen_trades.add(trade_id)
-    
-    # Cleanup seen_trades periodically
-    if len(seen_trades) > 50000:
-        seen_list = list(seen_trades)
-        seen_trades.clear()
-        for t in seen_list[-25000:]:
-            seen_trades.add(t)
-    
-    # === FILTER 1: Size Filter ===
-    size = float(trade_data.get("size", 0))
-    price = float(trade_data.get("price", 0))
-    trade_amount = size * price
-    
-    if trade_amount < MIN_TRADE_SIZE:
-        return
-    
-    stats["size_filtered"] += 1
-    
-    # === FILTER 2: Market Filter (Sports/Crypto) ===
-    condition_id = trade_data.get("condition_id") or trade_data.get("conditionId", "")
-    if is_excluded_market(condition_id):
-        stats["excluded_market"] += 1
-        return
-    
-    # === FILTER 3: Odds Filter (must be >= MIN_ODDS) ===
-    decimal_odds = (1 / price) if price > 0 else 0
-    if decimal_odds < MIN_ODDS:
-        stats["odds_filtered"] += 1
-        return
-    
-    # Get wallet
-    wallet = trade_data.get("proxy_wallet") or trade_data.get("proxyWallet")
-    if not wallet:
-        return
-    
-    # === FILTER 3: LP Detection ===
-    if is_liquidity_provider(wallet, condition_id):
-        stats["lp_filtered"] += 1
-        return
-    
-    # === SIGNAL DETECTION ===
-    profile = get_wallet_profile(wallet)
-    if not profile:
-        return
-    
-    positions = get_wallet_positions(wallet)
-    signals = detect_signals(trade_data, profile, positions)
-    
-    # Need at least 1 signal to alert
-    if len(signals) < 1:
-        stats["no_signals"] += 1
-        return
-    
-    # === ENRICH & ALERT ===
-    market_info = get_market_info(condition_id)
-    
-    # Get market activity for this wallet
-    market_slug = trade_data.get("market_slug") or trade_data.get("slug") or condition_id
-    market_activity = get_wallet_trades_on_market(wallet, market_slug)
-    
-    print(f"\n{'='*40}")
-    print(f"🚨 WHALE DETECTED!")
-    print(f"Amount: ${trade_amount:,.2f}")
-    print(f"Signals: {', '.join(signals)}")
-    print(f"{'='*40}")
-    
-    # Format and send alert
-    message = format_alert(trade_data, profile, signals, market_info, market_activity)
-    if send_telegram_message(message):
-        stats["alerts_sent"] += 1
+# =============================================================================
+# Trade Processor
+# =============================================================================
 
+class TradeProcessor:
+    def __init__(
+        self,
+        config: Config,
+        api: PolymarketAPI,
+        analyzer: SignalAnalyzer,
+        alerter: TelegramAlerter
+    ):
+        self.config = config
+        self.api = api
+        self.analyzer = analyzer
+        self.alerter = alerter
+        self.stats = Stats()
+        self._seen: LRUCache = LRUCache(maxsize=config.dedup_cache_size)
+
+        # Fast filters (no API calls)
+        self.filters: list[tuple[str, Filter]] = [
+            ("size", SizeFilter(config.min_trade_size)),
+            ("odds", OddsFilter(config.min_odds)),
+            ("market", MarketFilter(api)),
+        ]
+
+    def process(self, data: dict) -> None:
+        self.stats.trades_received += 1
+
+        # Parse trade
+        trade = Trade.from_ws_payload(data)
+        if not trade:
+            return
+
+        # Dedup
+        trade_id = f"{trade.tx_hash}-{trade.condition_id}"
+        if trade_id in self._seen:
+            return
+        self._seen[trade_id] = True
+
+        # Fast filters
+        if not self._apply_filters(trade):
+            return
+
+        # Enrich (API calls)
+        ctx = self._enrich(trade)
+        if not ctx:
+            return
+
+        # LP check
+        if self.analyzer.is_liquidity_provider(ctx.positions, trade.condition_id):
+            return
+        self.stats.passed_lp += 1
+
+        # Signal analysis
+        score, signals = self.analyzer.analyze(ctx)
+        if score < self.config.min_alert_score:
+            return
+
+        # Enrich with market info
+        ctx.market_info = self.api.get_market_info(trade.condition_id)
+
+        # Alert
+        log.info(f"🐋 WHALE: ${trade.amount_usd:,.0f} | Score: {score:.0f}")
+        message = self.alerter.format_alert(ctx, score, signals)
+        if self.alerter.send(message):
+            self.stats.alerts_sent += 1
+
+    def _apply_filters(self, trade: Trade) -> bool:
+        for name, filt in self.filters:
+            if not filt(trade):
+                return False
+            if name == "size":
+                self.stats.passed_size += 1
+            elif name == "odds":
+                self.stats.passed_odds += 1
+            elif name == "market":
+                self.stats.passed_market += 1
+        return True
+
+    def _enrich(self, trade: Trade) -> TradeContext | None:
+        profile = self.api.get_profile(trade.wallet)
+        if not profile:
+            return None
+        positions = self.api.get_positions(trade.wallet)
+        return TradeContext(trade=trade, profile=profile, positions=positions)
+
+
+# =============================================================================
+# WebSocket Client
+# =============================================================================
 
 class WebSocketClient:
-    """WebSocket client for Polymarket RTDS with connection health monitoring."""
+    WS_URL = "wss://ws-live-data.polymarket.com"
 
-    def __init__(self):
-        self.ws = None
-        self.connected = False
-        self.health_thread = None
-        self.should_run = True
-        self.reconnect_delay = 5
-        self.last_message_time = 0
-        self.stale_threshold = 30
+    def __init__(self, processor: TradeProcessor, config: Config):
+        self.processor = processor
+        self.config = config
+        self.ws: websocket.WebSocketApp | None = None
+        self._connected = False
+        self._should_run = True
+        self._last_message = 0.0
+        self._reconnect_delay = 5
 
-    def on_open(self, ws):
-        print("[WS] Connected to Polymarket RTDS")
-        self.connected = True
-        self.reconnect_delay = 5
-        self.last_message_time = time.time()
+    def start(self):
+        while self._should_run:
+            try:
+                self._connect()
+            except Exception as e:
+                log.error(f"WebSocket error: {e}")
 
-        subscribe_msg = {
+            if self._should_run:
+                log.info(f"Reconnecting in {self._reconnect_delay}s...")
+                time.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+
+    def stop(self):
+        self._should_run = False
+        if self.ws:
+            self.ws.close()
+
+    def _connect(self):
+        self.ws = websocket.WebSocketApp(
+            self.WS_URL,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
+
+    def _on_open(self, ws):
+        log.info("Connected to Polymarket RTDS")
+        self._connected = True
+        self._reconnect_delay = 5
+        self._last_message = time.time()
+
+        ws.send(json.dumps({
             "action": "subscribe",
             "subscriptions": [{"topic": "activity", "type": "trades"}]
-        }
-        ws.send(json.dumps(subscribe_msg))
-        print("[WS] Subscribed to activity/trades")
-        self.start_health_thread()
+        }))
+        log.info("Subscribed to activity/trades")
 
-    def on_message(self, ws, message):
-        self.last_message_time = time.time()
+        threading.Thread(target=self._health_monitor, daemon=True).start()
+
+    def _on_message(self, ws, message: str):
+        self._last_message = time.time()
         try:
             data = json.loads(message)
             if data.get("topic") == "activity" and data.get("type") == "trades":
                 payload = data.get("payload", {})
                 if payload:
-                    process_trade(payload)
+                    self.processor.process(payload)
         except json.JSONDecodeError:
             pass
-        except Exception as e:
-            print(f"[WS ERROR] {e}")
 
-    def on_error(self, ws, error):
-        print(f"[WS ERROR] {error}")
+    def _on_error(self, ws, error):
+        log.error(f"WebSocket error: {error}")
 
-    def on_close(self, ws, close_status_code, close_msg):
-        print(f"[WS] Connection closed: {close_status_code}")
-        self.connected = False
-        if self.should_run:
-            print(f"[WS] Reconnecting in {self.reconnect_delay}s...")
-            time.sleep(self.reconnect_delay)
-            self.reconnect_delay = min(self.reconnect_delay * 2, 60)
-            self.connect()
+    def _on_close(self, ws, status_code, msg):
+        log.info(f"WebSocket closed: {status_code}")
+        self._connected = False
 
-    def start_health_thread(self):
-        def health_loop():
-            while self.connected and self.should_run:
-                time.sleep(10)
-                if not self.connected:
-                    break
-                seconds_since = time.time() - self.last_message_time
-                if seconds_since > self.stale_threshold:
-                    print(f"[WS HEALTH] No messages for {seconds_since:.0f}s - reconnecting")
-                    self.connected = False
-                    if self.ws:
-                        self.ws.close()
-                    break
-
-        self.health_thread = threading.Thread(target=health_loop, daemon=True)
-        self.health_thread.start()
-
-    def connect(self):
-        self.ws = websocket.WebSocketApp(
-            RTDS_WS_URL,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        self.ws.run_forever(ping_interval=20, ping_timeout=10)
-
-    def stop(self):
-        self.should_run = False
-        if self.ws:
-            self.ws.close()
+    def _health_monitor(self):
+        while self._connected and self._should_run:
+            time.sleep(10)
+            if not self._connected:
+                break
+            stale = time.time() - self._last_message
+            if stale > self.config.ws_stale_threshold:
+                log.warning(f"No messages for {stale:.0f}s, reconnecting")
+                self._connected = False
+                if self.ws:
+                    self.ws.close()
+                break
 
 
-def print_stats_periodically():
-    """Print stats at configured interval."""
-    while True:
-        time.sleep(STATS_INTERVAL)
-        print(f"\n[STATS] Recv: {stats['trades_received']} | "
-              f"$2k+: {stats['size_filtered']} | "
-              f"Excluded: {stats['excluded_market']} | "
-              f"LP: {stats['lp_filtered']} | "
-              f"NoSig: {stats['no_signals']} | "
-              f"Alerts: {stats['alerts_sent']}")
-        refresh_excluded_markets()
+# =============================================================================
+# Main
+# =============================================================================
 
+def main():
+    config = Config.from_env()
 
-def run_detector():
-    """Main detection loop using WebSocket."""
-    print("=" * 60)
-    print("🐋 Polymarket Whale Detector v2 Starting...")
-    print("=" * 60)
-    print(f"Settings:")
-    print(f"  • Min Trade Size: ${MIN_TRADE_SIZE:,}")
-    print(f"  • Fresh Wallet: <{MAX_ACCOUNT_AGE_DAYS} days")
-    print(f"  • Excluded Tags: {EXCLUDED_TAG_IDS}")
-    print(f"  • Mode: Real-time WebSocket")
-    print("=" * 60)
+    log.info("=" * 50)
+    log.info("🐋 Polymarket Whale Detector v3")
+    log.info("=" * 50)
+    log.info(f"Min Trade: ${config.min_trade_size:,}")
+    log.info(f"Min Odds: {config.min_odds} ({100/config.min_odds:.0f}% implied)")
+    log.info(f"Fresh Wallet: <{config.max_account_age_days} days")
+    log.info(f"Alert Score: >={config.min_alert_score}")
+    log.info(f"Excluded Tags: {config.excluded_tag_ids}")
+    log.info("=" * 50)
 
-    print("[INFO] Loading excluded markets...")
-    refresh_excluded_markets()
+    api = PolymarketAPI(config)
+    analyzer = SignalAnalyzer(config)
+    alerter = TelegramAlerter(config)
+    processor = TradeProcessor(config, api, analyzer, alerter)
+    client = WebSocketClient(processor, config)
 
-    send_telegram_message("🐋 Whale Detector v2 Started!\n\nMonitoring for large trades with signal detection...")
+    # Stats printer
+    def print_stats():
+        while True:
+            time.sleep(config.stats_interval)
+            processor.stats.log()
 
-    stats_thread = threading.Thread(target=print_stats_periodically, daemon=True)
-    stats_thread.start()
+    threading.Thread(target=print_stats, daemon=True).start()
 
-    client = WebSocketClient()
+    alerter.send("🐋 Whale Detector v3 Started!")
+
     try:
-        client.connect()
+        client.start()
     except KeyboardInterrupt:
-        print("\n🛑 Stopping...")
+        log.info("Shutting down...")
         client.stop()
-        send_telegram_message("🛑 Whale Detector Stopped")
+        alerter.send("🛑 Whale Detector stopped")
 
 
 if __name__ == "__main__":
-    run_detector()
+    main()
