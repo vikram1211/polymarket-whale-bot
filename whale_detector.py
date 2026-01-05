@@ -548,20 +548,23 @@ def process_trade(trade_data: dict) -> None:
 
 
 class WebSocketClient:
-    """WebSocket client for Polymarket RTDS."""
+    """WebSocket client for Polymarket RTDS with connection health monitoring."""
 
     def __init__(self):
         self.ws = None
         self.connected = False
-        self.ping_thread = None
+        self.health_thread = None
         self.should_run = True
         self.reconnect_delay = 5
+        self.last_message_time = 0
+        self.stale_threshold = 30  # Force reconnect if no messages for 30s
 
     def on_open(self, ws):
         """Called when WebSocket connection is established."""
         print("[WS] Connected to Polymarket RTDS")
         self.connected = True
         self.reconnect_delay = 5  # Reset reconnect delay
+        self.last_message_time = time.time()
 
         # Subscribe to trades
         subscribe_msg = {
@@ -576,15 +579,14 @@ class WebSocketClient:
         ws.send(json.dumps(subscribe_msg))
         print("[WS] Subscribed to activity/trades")
 
-        # Start ping thread
-        self.start_ping_thread()
+        # Start health monitoring thread
+        self.start_health_thread()
 
     def on_message(self, ws, message):
         """Called when a message is received."""
+        self.last_message_time = time.time()  # Update on ANY message
+        
         try:
-            if message == "PONG":
-                return
-
             data = json.loads(message)
 
             # Handle trade messages
@@ -613,22 +615,35 @@ class WebSocketClient:
             self.reconnect_delay = min(self.reconnect_delay * 2, 60)  # Exponential backoff
             self.connect()
 
-    def start_ping_thread(self):
-        """Start a thread to send periodic pings."""
-        def ping_loop():
+    def start_health_thread(self):
+        """Start a thread to monitor connection health and force reconnect if stale."""
+        def health_loop():
             while self.connected and self.should_run:
                 try:
-                    if self.ws and self.connected:
-                        self.ws.send("PING")
-                    time.sleep(5)
-                except Exception:
+                    time.sleep(10)  # Check every 10 seconds
+                    
+                    if not self.connected:
+                        break
+                    
+                    # Check if connection is stale
+                    seconds_since_message = time.time() - self.last_message_time
+                    
+                    if seconds_since_message > self.stale_threshold:
+                        print(f"[WS HEALTH] No messages for {seconds_since_message:.0f}s - forcing reconnect")
+                        self.connected = False
+                        if self.ws:
+                            self.ws.close()
+                        break
+                        
+                except Exception as e:
+                    print(f"[WS HEALTH ERROR] {e}")
                     break
 
-        self.ping_thread = threading.Thread(target=ping_loop, daemon=True)
-        self.ping_thread.start()
+        self.health_thread = threading.Thread(target=health_loop, daemon=True)
+        self.health_thread.start()
 
     def connect(self):
-        """Connect to WebSocket."""
+        """Connect to WebSocket with ping/pong enabled."""
         self.ws = websocket.WebSocketApp(
             RTDS_WS_URL,
             on_open=self.on_open,
@@ -636,7 +651,8 @@ class WebSocketClient:
             on_error=self.on_error,
             on_close=self.on_close
         )
-        self.ws.run_forever()
+        # Enable WebSocket protocol-level ping/pong (every 20s, timeout 10s)
+        self.ws.run_forever(ping_interval=20, ping_timeout=10)
 
     def stop(self):
         """Stop the WebSocket client."""
