@@ -36,13 +36,15 @@ def mask_token(token):
 print(f"[CONFIG] TELEGRAM_BOT_TOKEN: {mask_token(TELEGRAM_BOT_TOKEN)}")
 print(f"[CONFIG] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
 
-# Detection thresholds (adjustable)
-MIN_TRADE_AMOUNT = int(os.getenv("MIN_TRADE_AMOUNT", 500))  # Minimum trade size in USD
-MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 60))  # Account must be newer than this
-MIN_CONCENTRATION = float(os.getenv("MIN_CONCENTRATION", 50))  # Min % of portfolio in single market
-MAX_MARKETS_TRADED = int(os.getenv("MAX_MARKETS_TRADED", 10))  # Max markets they've traded
-MIN_TRADES_ON_MARKET = int(os.getenv("MIN_TRADES_ON_MARKET", 3))  # Min trades on same market
-MIN_TOTAL_AMOUNT_ON_MARKET = int(os.getenv("MIN_TOTAL_AMOUNT_ON_MARKET", 5000))  # Min total $ on same market
+# Detection thresholds (adjustable) - LOWERED FOR TESTING
+MIN_TRADE_AMOUNT = int(os.getenv("MIN_TRADE_AMOUNT", 250))  # Minimum trade size in USD (was 500)
+MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 180))  # Account must be newer than this (was 60)
+MIN_CONCENTRATION = float(os.getenv("MIN_CONCENTRATION", 30))  # Min % of portfolio in single market (was 50)
+MAX_MARKETS_TRADED = int(os.getenv("MAX_MARKETS_TRADED", 20))  # Max markets they've traded (was 10)
+MIN_TRADES_ON_MARKET = int(os.getenv("MIN_TRADES_ON_MARKET", 1))  # Min trades on same market (was 3)
+MIN_TOTAL_AMOUNT_ON_MARKET = int(os.getenv("MIN_TOTAL_AMOUNT_ON_MARKET", 1000))  # Min total $ on same market (was 5000)
+MIN_WHALE_SCORE = int(os.getenv("MIN_WHALE_SCORE", 25))  # Minimum score to alert (was 40)
+MAX_PRICE = float(os.getenv("MAX_PRICE", 0.70))  # Max price/odds to consider (was 0.50)
 STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", 15))  # Seconds between stats prints
 
 # API endpoints
@@ -382,8 +384,8 @@ def analyze_trade(trade: dict) -> dict | None:
     if trade_amount < MIN_TRADE_AMOUNT:
         return None
 
-    # Skip trades with >50% implied probability (focus on longshots)
-    if price > 0.5:
+    # Skip trades with high implied probability (focus on longshots/value bets)
+    if price > MAX_PRICE:
         return None
 
     # Get wallet profile
@@ -561,7 +563,7 @@ def process_trade(trade_data: dict) -> None:
     # Analyze the trade
     analysis = analyze_trade(normalized_trade)
 
-    if analysis and analysis["whale_score"] >= 40:
+    if analysis and analysis["whale_score"] >= MIN_WHALE_SCORE:
         # Format and send alert
         message = format_alert_message(analysis)
         print(f"\n{'='*40}")
