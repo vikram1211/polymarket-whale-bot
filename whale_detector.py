@@ -498,7 +498,7 @@ def run_detector():
                 new_trades += 1
 
                 # Keep seen_trades from growing indefinitely
-                if len(seen_trades) > 10000:
+                if len(seen_trades) > 100000:
                     seen_trades.clear()
 
                 # Skip excluded markets (sports, crypto)
