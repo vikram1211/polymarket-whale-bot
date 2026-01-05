@@ -330,7 +330,12 @@ def analyze_trade(trade: dict) -> dict | None:
 
     # Get trade details
     trade_amount = float(trade.get("size", 0)) * float(trade.get("price", 0))
+    trade_price = float(trade.get("price", 0))
     market_id = trade.get("conditionId", "")
+
+    # Skip trades with <=50% implied probability
+    if trade_price <= 0.5:
+        return None
 
     # Get wallet profile
     profile = get_wallet_profile(wallet)
