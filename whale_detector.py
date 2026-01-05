@@ -38,7 +38,8 @@ print(f"[CONFIG] TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
 
 # Detection thresholds
 MIN_TRADE_SIZE = int(os.getenv("MIN_TRADE_SIZE", 2000))  # Minimum trade size in USD
-MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 30))  # Fresh wallet threshold
+MAX_ACCOUNT_AGE_DAYS = int(os.getenv("MAX_ACCOUNT_AGE_DAYS", 45))  # Fresh wallet threshold (was 30)
+MIN_ODDS = float(os.getenv("MIN_ODDS", 1.8))  # Minimum decimal odds (1.8 = 55.5% or less)
 STATS_INTERVAL = int(os.getenv("STATS_INTERVAL", 15))  # Seconds between stats prints
 
 # API endpoints
@@ -65,6 +66,7 @@ stats = {
     "trades_received": 0,
     "size_filtered": 0,
     "excluded_market": 0,
+    "odds_filtered": 0,
     "lp_filtered": 0,
     "no_signals": 0,
     "alerts_sent": 0
@@ -205,6 +207,31 @@ def get_wallet_positions(wallet: str) -> list:
         return []
 
 
+def get_wallet_trades_on_market(wallet: str, market_id: str) -> dict:
+    """
+    Get wallet's trade history on a specific market.
+    Returns: {"trade_count": int, "total_amount": float}
+    """
+    try:
+        response = requests.get(
+            f"{DATA_API}/trades",
+            params={"user": wallet, "market": market_id, "limit": 100},
+            timeout=10
+        )
+        if response.status_code == 200:
+            trades = response.json()
+            trade_count = len(trades)
+            total_amount = 0
+            for t in trades:
+                size = float(t.get("size", 0))
+                price = float(t.get("price", 0))
+                total_amount += size * price
+            return {"trade_count": trade_count, "total_amount": total_amount}
+        return {"trade_count": 0, "total_amount": 0}
+    except Exception:
+        return {"trade_count": 0, "total_amount": 0}
+
+
 def calculate_account_age(profile: dict) -> int:
     """Calculate account age in days."""
     created_at = profile.get("createdAt")
@@ -307,7 +334,7 @@ def get_market_info(condition_id: str) -> dict | None:
         return None
 
 
-def format_alert(trade_data: dict, profile: dict, signals: list, market_info: dict) -> str:
+def format_alert(trade_data: dict, profile: dict, signals: list, market_info: dict, market_activity: dict) -> str:
     """Format the alert message for Telegram."""
     size = float(trade_data.get("size", 0))
     price = float(trade_data.get("price", 0))
@@ -326,6 +353,10 @@ def format_alert(trade_data: dict, profile: dict, signals: list, market_info: di
     # Format signals
     signal_list = "\n".join([f"  • {s}" for s in signals])
     
+    # Market activity
+    total_trades = market_activity.get("trade_count", 0)
+    total_invested = market_activity.get("total_amount", 0)
+    
     message = f"""
 🚨 <b>WHALE ALERT</b>
 
@@ -339,7 +370,11 @@ def format_alert(trade_data: dict, profile: dict, signals: list, market_info: di
   • Username: {username}
   • Account Age: {account_age} days
 
-<b>Signals Detected:</b>
+<b>Activity on This Market:</b>
+  • Total Trades: {total_trades}
+  • Total Invested: ${total_invested:,.2f}
+
+<b>Signals:</b>
 {signal_list}
 
 🔗 <a href="https://polygonscan.com/tx/{trade_data.get('transaction_hash', '')}">View TX</a>
@@ -382,6 +417,12 @@ def process_trade(trade_data: dict) -> None:
         stats["excluded_market"] += 1
         return
     
+    # === FILTER 3: Odds Filter (must be >= MIN_ODDS) ===
+    decimal_odds = (1 / price) if price > 0 else 0
+    if decimal_odds < MIN_ODDS:
+        stats["odds_filtered"] += 1
+        return
+    
     # Get wallet
     wallet = trade_data.get("proxy_wallet") or trade_data.get("proxyWallet")
     if not wallet:
@@ -408,6 +449,10 @@ def process_trade(trade_data: dict) -> None:
     # === ENRICH & ALERT ===
     market_info = get_market_info(condition_id)
     
+    # Get market activity for this wallet
+    market_slug = trade_data.get("market_slug") or trade_data.get("slug") or condition_id
+    market_activity = get_wallet_trades_on_market(wallet, market_slug)
+    
     print(f"\n{'='*40}")
     print(f"🚨 WHALE DETECTED!")
     print(f"Amount: ${trade_amount:,.2f}")
@@ -415,7 +460,7 @@ def process_trade(trade_data: dict) -> None:
     print(f"{'='*40}")
     
     # Format and send alert
-    message = format_alert(trade_data, profile, signals, market_info)
+    message = format_alert(trade_data, profile, signals, market_info, market_activity)
     if send_telegram_message(message):
         stats["alerts_sent"] += 1
 
