@@ -368,7 +368,7 @@ def analyze_trade(trade: dict) -> dict | None:
 
     # Get total markets traded
     stats = get_wallet_stats(wallet)
-    markets_traded = stats.get("total", 0) if stats else 0
+    markets_traded = stats.get("traded", 0) if stats else 0
 
     # Calculate a "whale score" (higher = more suspicious)
     whale_score = 0
